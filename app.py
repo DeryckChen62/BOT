@@ -5,12 +5,28 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 import os
 import json
 import random
+import re
+
+from db import (
+    init_db,
+    upsert_user_target,
+    add_expense,
+    get_expenses_between,
+    get_expenses_on,
+    set_setting,
+    get_setting,
+)
+from utils import today_str, week_range_today, month_range_today, month_range_ym
+from scheduler import start_scheduler
 
 app = Flask(__name__)
 
 line_bot_api = LineBotApi(os.getenv('LINE_CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.getenv('LINE_CHANNEL_SECRET'))
 
+# -----------------------------
+# 原本的「關鍵字次數統計」(JSON)
+# -----------------------------
 COUNT_FILE = "keyword_counts.json"
 
 def load_counts():
@@ -21,22 +37,12 @@ def load_counts():
 
 def save_counts(data):
     with open(COUNT_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f)
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 user_keyword_counts = load_counts()
 
 quotes = [
     "你已經比昨天更棒了耶 ✨",
-    "不要小看現在努力的你，那是未來爆閃的伏筆！（•̀ᴗ•́）و",
-    "今天也是很讚的一天（因為有你在啊！）(๑´ㅂ`๑)",
-    "你撐下來的每一秒，都是超帥氣的成就💪",
-    "就算世界毀滅，你也記得吃飯睡覺喝水喔 ✧٩(ˊωˋ*)و✧",
-    "你不是一顆螺絲，你是整個機器運轉的靈魂！٩(｡•́‿•̀｡)۶",
-    "今天的你，光是站著就有氣場 ✨",
-    "失敗了沒關係，我們下次可以一起怪天氣 ╮(╯∀╰)╭",
-    "你是那種，即使偷偷 emo 還是會照亮別人的可愛存在 ✿",
-    "今天也要記得笑一下，雖然笑不出來也沒關係，我幫你笑 (๑¯∀¯๑)"
-     "你已經比昨天更棒了耶 ✨",
     "不要小看現在努力的你，那是未來爆閃的伏筆！（•̀ᴗ•́）و",
     "今天也是很讚的一天（因為有你在啊！）(๑´ㅂ`๑)",
     "你撐下來的每一秒，都是超帥氣的成就💪",
@@ -68,7 +74,7 @@ quotes = [
     "你還在撐，這件事本身就值得慶祝 🎉"
 ]
 
-def get_positive_comment(score):
+def get_positive_comment(score: int) -> str:
     if score >= 96:
         return random.choice([
             "這不是好棒，是傳奇了 ✨",
@@ -118,13 +124,28 @@ def get_positive_comment(score):
             "有時候發呆，也是一種自我照顧 🛋️"
         ])
 
+HELP_TEXT = """可用指令：
+【記帳】
+- 記帳 金額 類別 [備註...]
+- 本週合計
+- 本月合計
+- 查 YYYY-MM-DD
+- 類別統計 [本週|本月|YYYY-MM]
+- 提醒開 / 提醒關（每天 21:00 檢查今日是否記帳）
+
+【互動（群組可用）】
+- 我今天好棒嗎 / 今日好棒指數
+- 鼓勵我
+- 查詢 關鍵字（查你在群組說某關鍵字的次數）
+"""
+
 @app.route("/")
 def index():
     return "LINE Bot is running!"
 
 @app.route("/callback", methods=['POST'])
 def callback():
-    signature = request.headers['X-Line-Signature']
+    signature = request.headers.get('X-Line-Signature', '')
     body = request.get_data(as_text=True)
 
     try:
@@ -133,12 +154,112 @@ def callback():
         abort(400)
     return 'OK'
 
+def _handle_accounting(msg_raw: str, user_id: str):
+    """
+    Return reply text if matched; otherwise None
+    """
+    if msg_raw in ("help", "說明", "指令", "功能"):
+        return HELP_TEXT
+
+    # 記帳 金額 類別 [備註...]
+    m = re.match(r"^記帳\s+(-?\d+(?:\.\d+)?)\s+(\S+)(?:\s+(.+))?$", msg_raw)
+    if m:
+        amount = float(m.group(1))
+        category = m.group(2).strip()
+        memo = (m.group(3) or "").strip()
+        spent = today_str()
+        add_expense(user_id=user_id, amount=amount, category=category, memo=memo, spent_date=spent)
+        return f"已記帳 ✅\n日期：{spent}\n金額：{amount}\n類別：{category}\n備註：{memo or '-'}"
+
+    if msg_raw == "本週合計":
+        d1, d2 = week_range_today()
+        rows = get_expenses_between(user_id, d1, d2)
+        total = sum(float(r["amount"]) for r in rows)
+        return f"本週（{d1}～{d2}）合計：{total:.2f}\n筆數：{len(rows)}"
+
+    if msg_raw == "本月合計":
+        d1, d2 = month_range_today()
+        rows = get_expenses_between(user_id, d1, d2)
+        total = sum(float(r["amount"]) for r in rows)
+        return f"本月（{d1}～{d2}）合計：{total:.2f}\n筆數：{len(rows)}"
+
+    m = re.match(r"^查\s+(\d{4}-\d{2}-\d{2})$", msg_raw)
+    if m:
+        day = m.group(1)
+        rows = get_expenses_on(user_id, day)
+        if not rows:
+            return f"{day} 沒有記帳紀錄。"
+        lines = [f"{day} 記帳："]
+        total = 0.0
+        for r in rows[:50]:
+            total += float(r["amount"])
+            memo = (r.get("memo") or "").strip()
+            lines.append(f'- {r["amount"]}｜{r["category"]}｜{memo}')
+        lines.append(f"合計：{total:.2f}（{len(rows)} 筆）")
+        return "\n".join(lines)
+
+    m = re.match(r"^類別統計(?:\s+(本週|本月|\d{4}-\d{2}))?$", msg_raw)
+    if m:
+        mode = m.group(1) or "本月"
+        if mode == "本週":
+            d1, d2 = week_range_today()
+            label = f"本週（{d1}～{d2}）"
+        elif mode == "本月":
+            d1, d2 = month_range_today()
+            label = f"本月（{d1}～{d2}）"
+        else:
+            d1, d2 = month_range_ym(mode)
+            label = f"{mode}（{d1}～{d2}）"
+
+        rows = get_expenses_between(user_id, d1, d2)
+        if not rows:
+            return f"{label} 沒有記帳紀錄。"
+        by_cat = {}
+        for r in rows:
+            cat = r["category"]
+            by_cat[cat] = by_cat.get(cat, 0.0) + float(r["amount"])
+        items = sorted(by_cat.items(), key=lambda x: x[1], reverse=True)
+        lines = [f"{label} 類別統計："]
+        for cat, amt in items[:20]:
+            lines.append(f"- {cat}: {amt:.2f}")
+        lines.append(f"合計：{sum(by_cat.values()):.2f}")
+        return "\n".join(lines)
+
+    if msg_raw == "提醒開":
+        set_setting("no_expense_reminder_enabled", "1")
+        return "記帳提醒已開啟 ✅（每日 21:00 檢查）"
+
+    if msg_raw == "提醒關":
+        set_setting("no_expense_reminder_enabled", "0")
+        return "記帳提醒已關閉 ✅"
+
+    return None
+
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     global user_keyword_counts
-    msg = event.message.text.strip().lower()
-    user_id = event.source.user_id
 
+    msg_raw = event.message.text.strip()
+    msg = msg_raw.lower()
+    user_id = event.source.user_id  # may exist in group/room/user (depends on LINE settings)
+
+    # 記錄 user 以便推播提醒
+    if user_id:
+        upsert_user_target(user_id)
+
+    # 先處理記帳功能（群組/私訊都可用；但需要 user_id）
+    if user_id:
+        acc_reply = _handle_accounting(msg_raw, user_id)
+        if acc_reply:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=acc_reply))
+            return
+    else:
+        # 沒拿到 user_id 時，仍可回 help
+        if msg_raw in ("help", "說明", "指令", "功能"):
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=HELP_TEXT))
+            return
+
+    # 下面是你原本的互動功能：維持「群組」才有
     if event.source.type == 'group':
         keyword_replies = {
             "不好": "你很好!!你很好!!你很好!!",
@@ -152,31 +273,41 @@ def handle_message(event):
             "廢物": "你不是廢物，是超級廢物戰士（誤）其實你很棒啦（ﾉ>ω<）ﾉ"
         }
 
-        if msg in keyword_replies:
+        if msg_raw in keyword_replies:
             if user_id not in user_keyword_counts:
                 user_keyword_counts[user_id] = {}
-            user_keyword_counts[user_id][msg] = user_keyword_counts[user_id].get(msg, 0) + 1
+            user_keyword_counts[user_id][msg_raw] = user_keyword_counts[user_id].get(msg_raw, 0) + 1
             save_counts(user_keyword_counts)
 
-            count = user_keyword_counts[user_id][msg]
-            reply = f"{keyword_replies[msg]}（你說過「{msg}」{count} 次）"
+            count = user_keyword_counts[user_id][msg_raw]
+            reply = f"{keyword_replies[msg_raw]}（你說過「{msg_raw}」{count} 次）"
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
 
-        elif msg.startswith("查詢 "):
-            keyword = msg.replace("查詢 ", "")
+        if msg.startswith("查詢 "):
+            keyword = msg_raw.replace("查詢 ", "", 1).strip()
             count = user_keyword_counts.get(user_id, {}).get(keyword, 0)
             reply = f"你目前說「{keyword}」共 {count} 次。"
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
 
-        elif msg in ["我今天好棒嗎", "今日好棒指數"]:
+        if msg_raw in ["我今天好棒嗎", "今日好棒指數"]:
             score = random.randint(1, 100)
             comment = get_positive_comment(score)
             reply = f"🎯 今日好棒指數為：{score}%\n{comment}"
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
 
-        elif msg in ["鼓勵我"]:
+        if msg_raw in ["鼓勵我"]:
             quote = random.choice(quotes)
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=quote))
+            return
+
+# -----------------------------
+# 初始化 DB & 排程（提醒功能）
+# -----------------------------
+init_db()
+start_scheduler(line_bot_api)
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
