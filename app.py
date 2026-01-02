@@ -24,11 +24,12 @@ def health():
 from datetime import datetime, timezone
 
 @app.post("/expense")
+
 def add_expense():
     data = request.get_json(silent=True) or {}
 
-    # 🔍 Debug：在 Render log 看清楚捷徑到底送了什麼
-    print("RAW JSON:", data)
+    print("RAW JSON =", data)
+    print("RAW amount =", data.get("amount"), type(data.get("amount")))   
 
     category = data.get("category", "未分類")
     amount_raw = data.get("amount", 0)
