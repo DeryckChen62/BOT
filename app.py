@@ -21,25 +21,31 @@ def headers():
 def health():
     return jsonify({"ok": True})
 
+from datetime import datetime, timezone
 
 @app.post("/expense")
 def add_expense():
     data = request.get_json(silent=True) or {}
 
-    # ✅ 全部用 .get()，不會再 KeyError
+    # 🔍 Debug：在 Render log 看清楚捷徑到底送了什麼
+    print("RAW JSON:", data)
+
     category = data.get("category", "未分類")
     amount_raw = data.get("amount", 0)
-    date = data.get("date")              # 建議格式: "YYYY-MM-DD"
-    month = data.get("month", "十二月")   # 先固定也 OK
+    date = data.get("date")  # 期待 "YYYY-MM-DD"
+    month = data.get("month", "十二月")
     note = data.get("note", "")
 
-    # ✅ amount 轉成 number（允許 "120" 這種字串）
+    # ✅ 若 date 沒送到，就用今天（UTC）補上，避免 Notion 報 null
+    if not date:
+        date = datetime.now(timezone.utc).date().isoformat()  # e.g. "2026-01-01"
+
     try:
         amount = float(amount_raw)
     except (TypeError, ValueError):
         amount = 0.0
 
-    title = f"【{category}】{amount_raw}"
+    title = f"[{category}] {amount_raw}"
 
     payload = {
         "parent": {"database_id": NOTION_DATABASE_ID},
