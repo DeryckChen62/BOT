@@ -144,7 +144,7 @@ def add_expense():
     if not month or (len(month) == 10 and month[4] == "-" and month[7] == "-"):
         month = month_from_date(date_str)
 
-    title = f"[{category}] {amount}"
+    title = f"{category}-{note}-{amount}" if note else f"{category}-{amount}"
 
     # Notion Create Page
     url = "https://api.notion.com/v1/pages"
